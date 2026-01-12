@@ -7,13 +7,13 @@
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=lichess.org
 // @grant       none
 // @run-at      document-start
-// @require     https://raw.githubusercontent.com/workinworld/stkfish/main/stockfish8.js
-// @require     https://code.jquery.com/jquery-3.6.0.min.js
-// @require     https://raw.githubusercontent.com/mchappychen/lichess-funnies/main/chess.js
-// @require     https://raw.githubusercontent.com/mchappychen/lichess-funnies/main/stockfish.js
-// @require     https://raw.githubusercontent.com/redwhitedaffodil/josechjs/refs/heads/main/dist/js-chess-engine.js
-// @require     https://raw.githubusercontent.com/reductionfear/jsengimore/refs/heads/main/tomitankChess_1_5.js
-// @require     https://raw.githubusercontent.com/reductionfear/jsengimore/refs/heads/main/tomitankChess_5_1.js
+// @require     https://raw.githubusercontent.com/reductionfear/lichatoextension/refs/heads/main/stockfish8.js
+// @require     https://raw.githubusercontent.com/reductionfear/lichatoextension/refs/heads/main/jquery-3.6.0.min.js
+// @require     https://raw.githubusercontent.com/reductionfear/lichatoextension/refs/heads/main/chess.js
+// @require     https://raw.githubusercontent.com/reductionfear/lichatoextension/refs/heads/main/stockfish.js
+// @require     https://raw.githubusercontent.com/reductionfear/lichatoextension/refs/heads/main/js-chess-engine.js
+// @require     https://raw.githubusercontent.com/reductionfear/lichatoextension/refs/heads/main/tomitankChess_1_5.js
+// @require     https://raw.githubusercontent.com/reductionfear/lichatoextension/refs/heads/main/tomitankChess_5_1.js
 // ==/UserScript==
 
 /* globals jQuery, $, Chess, stockfish, STOCKFISH, lichess, game */
