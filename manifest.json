@@ -15,6 +15,9 @@
         "chess.js",
         "stockfish8.js",
         "stockfish.js",
+        "js-chess-engine.js",
+        "tomitankChess_1_5.js",
+        "tomitankChess_5_1.js",
         "content.js"
       ],
       "run_at": "document_start",
