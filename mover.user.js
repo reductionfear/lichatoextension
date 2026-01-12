@@ -1,23 +1,36 @@
 // ==UserScript==
-// @name        Lichess Funnies v36.6 (Speed Optimized + Skill Level 0 Panic) reconnection fix limited
-// @version     36.6
-// @description Chess automation - speed optimized with smart lag compensation and weakened panic mode
-// @author      Michael and Ian (modified with Config Toggles)
+// @name        Lichess Funnies v44.4 (Full UI Control + Tomitank)
+// @version     44.1
+// @description Chess automation with engine selection & full UI controls
+// @author      Michael, Ian, Nuro (merged)
 // @match       https://lichess.org/*
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=lichess.org
 // @grant       none
 // @run-at      document-start
-// @updateURL   https://github.com/mchappychen/lichess-funnies/blob/main/lichess.user.js
-// @downloadURL https://github.com/mchappychen/lichess-funnies/blob/main/lichess.user.js
-// @require     https://raw.githubusercontent.com/redwhitedaffodil/lichatoextension/refs/heads/main/stockfish8.js
-// @require     https://raw.githubusercontent.com/redwhitedaffodil/lichatoextension/refs/heads/main/jquery-3.6.0.min.js
-// @require     https://raw.githubusercontent.com/redwhitedaffodil/lichatoextension/refs/heads/main/chess.js
-// @require     https://raw.githubusercontent.com/redwhitedaffodil/lichatoextension/refs/heads/main/stockfish.js
+// @require     https://raw.githubusercontent.com/workinworld/stkfish/main/stockfish8.js
+// @require     https://code.jquery.com/jquery-3.6.0.min.js
+// @require     https://raw.githubusercontent.com/mchappychen/lichess-funnies/main/chess.js
+// @require     https://raw.githubusercontent.com/mchappychen/lichess-funnies/main/stockfish.js
+// @require     https://raw.githubusercontent.com/redwhitedaffodil/josechjs/refs/heads/main/dist/js-chess-engine.js
+// @require     https://raw.githubusercontent.com/reductionfear/jsengimore/refs/heads/main/tomitankChess_1_5.js
+// @require     https://raw.githubusercontent.com/reductionfear/jsengimore/refs/heads/main/tomitankChess_5_1.js
 // ==/UserScript==
-/* globals jQuery, $, Chess, stockfish, lichess, game */
 
-// NOTE: Lichess is a single-page app (SPA). Games often start without a full page reload,
-// so we must NOT exit early on the homepage. We simply wait for game DOM nodes to appear.
+/* globals jQuery, $, Chess, stockfish, STOCKFISH, lichess, game */
+
+// NOTE: Lichess is a single-page app (SPA). Games often start without a full page reload.
+
+// --- ENGINE SELECTION ---
+// "stockfish" = main stockfish.js (normal mode)
+// "stockfish8" = stockfish8.js (panic mode - Skill Level 0)
+// "jschess" = js-chess-engine
+// "tomitank15" = Tomitank 1.5
+// "tomitank51" = Tomitank 5.1
+let selectedEngine = localStorage.getItem('selectedEngine') || 'stockfish';
+
+// --- STRENGTH SETTINGS ---
+const JS_CHESS_AI_LEVEL = 2; // Normal play (0-4)
+const PANIC_LEVEL = 1;       // PANIC play (Weakest possible)
 
 // --- VPN/Network Lag Compensation ---
 let vpnPingOffset = parseInt(localStorage.getItem('vpnPingOffset')) || 0;
@@ -26,7 +39,6 @@ const MAX_LAG_HISTORY = 5;
 
 function updateServerLag(clockData) {
   if (clockData && typeof clockData.lag === 'number') {
-    // Server reports in centiseconds (5 = 50ms)
     const lagMs = clockData.lag * 10;
     serverLagHistory.push(lagMs);
     if (serverLagHistory.length > MAX_LAG_HISTORY) {
@@ -55,6 +67,30 @@ function getPanicLagCompensation() {
   return Math.min(totalLag, maxReasonable);
 }
 
+// --- JS-CHESS-ENGINE STATE TRACKING ---
+let jsChessPendingMove = null;
+let jsChessPendingFen = null;
+let jsChessRetryCount = 0;
+let jsChessWaitingForReconnect = false;
+const JS_CHESS_MAX_RETRIES = 5;
+const JS_CHESS_RETRY_INTERVAL = 100;
+
+// --- TOMITANK ENGINE STATE TRACKING ---
+let tomitank15Calculating = false;
+let tomitank15PendingMove = null;
+let tomitank15PendingFen = null;
+const TOMITANK15_TIMEOUT_MS = 100;
+const TOMITANK15_DEPTH = 2;
+const TOMITANK15_PANIC_DEPTH = 1;           // ADD THIS
+const TOMITANK15_PANIC_SEARCH_TIME = 50;    // ADD THIS
+let tomitank51Calculating = false;
+let tomitank51PendingMove = null;
+let tomitank51PendingFen = null;
+const TOMITANK51_TIMEOUT_MS = 100;
+const TOMITANK51_DEPTH = 2;
+const TOMITANK51_PANIC_DEPTH = 1;           // ADD THIS
+const TOMITANK51_PANIC_SEARCH_TIME = 50;    // ADD THIS
+
 // --- Game State Tracking ---
 let gameEnded = false;
 let lastMoveAcked = false;
@@ -76,28 +112,40 @@ function resetGameState() {
   humanTimingStats = { totalMoves: 0, totalTimeMs: 0, engineTimeMs: 0 };
   varietyStats = { pv1: 0, pv2: 0, pv3: 0, pv4: 0, blunders: 0 };
   gameBlunderCount = 0;
-  panicModeEnabled = false; // Reset panic mode on new game
-  // Reset panic engine state
+  panicModeEnabled = false;
   panicEngineCalculating = false;
   panicLastRequestTime = 0;
   panicLastFenRequested = null;
+  // Reset js-chess state
+  jsChessPendingMove = null;
+  jsChessPendingFen = null;
+  jsChessRetryCount = 0;
+  jsChessWaitingForReconnect = false;
+
+  // Reset tomitank state
+  tomitank15PendingMove = null;
+  tomitank15PendingFen = null;
+  tomitank15Calculating = false;
+  tomitank51PendingMove = null;
+  tomitank51PendingFen = null;
+  tomitank51Calculating = false;
+
   console.log('[State] Game state reset');
 }
 
-// --- PANIC ENGINE (chess_engine.js alternative) ---
+// --- PANIC ENGINE (stockfish8.js - Skill Level 0) ---
 let panicEngine = null;
 let panicEngineReady = false;
 let panicCurrentFen = "";
 let panicBestMove = null;
-let panicModeEnabled = true; // UI-controlled panic mode toggle
+let panicModeEnabled = false;
 
-// NEW: Panic engine state tracking to prevent freezing
 let panicEngineCalculating = false;
 let panicLastRequestTime = 0;
 let panicLastFenRequested = null;
 let panicWatchdogTimer = null;
 let panicEngineRetryCount = 0;
-const PANIC_TIMEOUT_MS = 500; // Max time to wait for panic engine response
+const PANIC_TIMEOUT_MS = 500;
 const PANIC_MAX_RETRIES = 3;
 
 function initializePanicEngine() {
@@ -106,45 +154,39 @@ function initializePanicEngine() {
   try {
     panicEngine = window.STOCKFISH();
 
-    // --- ADDED: Limited Strength / Skill Level 0 ---
     panicEngine.postMessage("uci");
-    panicEngine.postMessage("setoption name Skill Level value 0");
-    panicEngine.postMessage("setoption name Hash value 16"); // Minimal memory
-    // -----------------------------------------------
+    panicEngine.postMessage(`setoption name Skill Level value ${PANIC_LEVEL}`);
+    panicEngine.postMessage("setoption name Hash value 16");
 
     panicEngine.onmessage = function(event) {
       if (event && typeof event === 'string' && event.includes("bestmove")) {
         panicBestMove = event.split(" ")[1];
-        panicEngineCalculating = false; // Mark engine as free
-        panicEngineRetryCount = 0; // Reset retry count on success
+        panicEngineCalculating = false;
+        panicEngineRetryCount = 0;
 
-        // Clear watchdog timer
         if (panicWatchdogTimer) {
           clearTimeout(panicWatchdogTimer);
           panicWatchdogTimer = null;
         }
 
-        // Guards: Don't send if game ended, already pending, or websocket dead
         if (gameEnded) {
-          console.log(`[⚡ PANIC] ❌ Game ended, not sending`);
+          console.log(`[⚡ PANIC SF8] ❌ Game ended, not sending`);
           return;
         }
         if (pendingMoveUci) {
-          console.log(`[⚡ PANIC] ❌ Move already pending: ${pendingMoveUci}`);
+          console.log(`[⚡ PANIC SF8] ❌ Move already pending: ${pendingMoveUci}`);
           return;
         }
         if (!webSocketWrapper || webSocketWrapper.readyState !== 1) {
-          console.log(`[⚡ PANIC] ❌ WebSocket not ready, will retry on reconnect`);
-          // Queue for retry on reconnect
+          console.log(`[⚡ PANIC SF8] ❌ WebSocket not ready, will retry on reconnect`);
           scheduleReconnectRetry();
           return;
         }
 
-        // Only execute if panic mode is enabled via UI button
         if (panicModeEnabled && panicBestMove) {
           const lagClaim = getPanicLagCompensation();
           const clockSecs = getClockSeconds();
-          console.log(`[⚡ PANIC ENGINE] Sending: ${panicBestMove} | Clock: ${clockSecs.toFixed(1)}s | Lag: ${lagClaim}ms`);
+          console.log(`[⚡ PANIC SF8] Sending: ${panicBestMove} | Clock: ${clockSecs.toFixed(1)}s | Lag: ${lagClaim}ms`);
           webSocketWrapper.send(JSON.stringify({
             t: "move",
             d: { u: panicBestMove, a: currentAck, b: 1, l: lagClaim }
@@ -155,16 +197,15 @@ function initializePanicEngine() {
       }
     };
     panicEngineReady = true;
-    console.log('[Panic Engine] ✅ Initialized (Skill Level 0)');
+    console.log(`[Panic Engine SF8] ✅ Initialized (Skill Level ${PANIC_LEVEL})`);
   } catch (e) {
-    console.error('[Panic Engine] ❌ Failed to initialize:', e);
+    console.error('[Panic Engine SF8] ❌ Failed to initialize:', e);
     panicEngineReady = false;
   }
 }
 
-// NEW: Reinitialize panic engine if it becomes unresponsive
 function reinitializePanicEngine() {
-  console.log('[Panic Engine] 🔄 Reinitializing...');
+  console.log('[Panic Engine SF8] 🔄 Reinitializing...');
   panicEngine = null;
   panicEngineReady = false;
   panicEngineCalculating = false;
@@ -172,7 +213,6 @@ function reinitializePanicEngine() {
   initializePanicEngine();
 }
 
-// NEW: Watchdog timeout handler
 function handlePanicTimeout() {
   console.log(`[⚡ PANIC] ⚠️ Engine timeout after ${PANIC_TIMEOUT_MS}ms`);
   panicEngineCalculating = false;
@@ -184,13 +224,12 @@ function handlePanicTimeout() {
     panicEngineRetryCount = 0;
   }
 
-  // Try to recover by triggering a new calculation if still our turn
   if (panicModeEnabled && !gameEnded && !pendingMoveUci) {
     const cgWrap = $('.cg-wrap')[0];
     if (cgWrap) {
       const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
       if (game.turn() === myCol) {
-        console.log(`[⚡ PANIC] 🔄 Retrying calculation...`);
+        console.log(`[⚡ PANIC] 🔄 Retrying calculation... `);
         setTimeout(() => {
           isProcessing = false;
           pendingMove = false;
@@ -201,54 +240,99 @@ function handlePanicTimeout() {
   }
 }
 
-// NEW: Schedule retry on WebSocket reconnect
 let reconnectRetryScheduled = false;
+
 function scheduleReconnectRetry() {
   if (reconnectRetryScheduled) return;
   reconnectRetryScheduled = true;
+
+  console.log(`[Reconnect] 📡 Scheduling reconnect retry for engine: ${selectedEngine}`);
 
   const checkReconnect = setInterval(() => {
     if (webSocketWrapper && webSocketWrapper.readyState === 1) {
       clearInterval(checkReconnect);
       reconnectRetryScheduled = false;
-      console.log(`[⚡ PANIC] 🔄 WebSocket reconnected, retrying...`);
+      console.log(`[Reconnect] 🔄 WebSocket reconnected, retrying with engine: ${selectedEngine}`);
 
-      // Reset state and retry if still in panic mode
-      if (panicModeEnabled && !gameEnded) {
+      if (!gameEnded) {
         panicEngineCalculating = false;
         isProcessing = false;
         pendingMove = false;
         pendingMoveUci = null;
-        setTimeout(processTurn, 100);
+
+        // Handle js-chess pending move
+        if (selectedEngine === 'jschess' && jsChessPendingMove) {
+          jsChessWaitingForReconnect = false;
+
+          // Verify position is still valid
+          const currentFen = game.fen();
+          const cgWrap = $('.cg-wrap')[0];
+
+          if (cgWrap) {
+            const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+
+            if (game.turn() === myCol) {
+              // Check if the cached move's FEN matches current position (first part only - pieces)
+              const cachedFenPieces = jsChessPendingFen ? jsChessPendingFen.split(' ')[0] : null;
+              const currentFenPieces = currentFen.split(' ')[0];
+
+              if (cachedFenPieces === currentFenPieces && jsChessPendingMove) {
+                console.log(`[JS-Chess] 🔄 Reconnect: Position valid, sending cached move: ${jsChessPendingMove}`);
+                const lagClaim = panicModeEnabled ? getPanicLagCompensation() : getLagCompensation();
+                webSocketWrapper.send(JSON.stringify({
+                  t: "move",
+                  d: { u: jsChessPendingMove, a: currentAck, b: panicModeEnabled ? 1 : 0, l: lagClaim }
+                }));
+                jsChessPendingMove = null;
+                jsChessPendingFen = null;
+                jsChessRetryCount = 0;
+                return;
+              } else {
+                console.log(`[JS-Chess] 🔄 Reconnect: Position changed, recalculating...`);
+                jsChessPendingMove = null;
+                jsChessPendingFen = null;
+                jsChessRetryCount = 0;
+                // Fall through to processTurn
+              }
+            }
+          }
+        }
+
+        // Resume if auto is enabled and it's our turn
+        if (autoHint) {
+          const cgWrap = $('.cg-wrap')[0];
+          if (cgWrap) {
+            const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+            if (game.turn() === myCol) {
+              setTimeout(processTurn, 50);
+            }
+          }
+        }
       }
     }
-  }, 100);
+  }, 50);
 
-  // Stop checking after 10 seconds
   setTimeout(() => {
     clearInterval(checkReconnect);
     reconnectRetryScheduled = false;
+    jsChessWaitingForReconnect = false;
   }, 10000);
 }
 
-function panicCalculateMove(fen) {
-  // Guard: Don't start new calculation if engine is busy
+function panicCalculateMoveSF8(fen) {
   if (panicEngineCalculating) {
     const elapsed = Date.now() - panicLastRequestTime;
     if (elapsed < PANIC_TIMEOUT_MS) {
-      console.log(`[⚡ PANIC] ⏳ Engine busy (${elapsed}ms), waiting...`);
+      console.log(`[⚡ PANIC SF8] ⏳ Engine busy (${elapsed}ms), waiting...`);
       return;
     } else {
-      // Engine seems stuck, force reset
-      console.log(`[⚡ PANIC] ⚠️ Engine stuck for ${elapsed}ms, forcing reset`);
+      console.log(`[⚡ PANIC SF8] ⚠️ Engine stuck for ${elapsed}ms, forcing reset`);
       panicEngineCalculating = false;
     }
   }
 
-  // Guard: Don't recalculate same position
   if (fen === panicLastFenRequested && panicBestMove) {
-    console.log(`[⚡ PANIC] ♻️ Using cached move for same position: ${panicBestMove}`);
-    // Directly send cached move
+    console.log(`[⚡ PANIC SF8] ♻️ Using cached move: ${panicBestMove}`);
     if (panicModeEnabled && !gameEnded && !pendingMoveUci && webSocketWrapper?.readyState === 1) {
       const lagClaim = getPanicLagCompensation();
       webSocketWrapper.send(JSON.stringify({
@@ -264,39 +348,554 @@ function panicCalculateMove(fen) {
   if (!panicEngine || !panicEngineReady) {
     initializePanicEngine();
     if (!panicEngineReady) {
-      setTimeout(() => panicCalculateMove(fen), 50);
+      setTimeout(() => panicCalculateMoveSF8(fen), 50);
       return;
     }
   }
 
-  // Mark engine as busy and set watchdog
   panicEngineCalculating = true;
   panicLastRequestTime = Date.now();
   panicLastFenRequested = fen;
   panicCurrentFen = fen;
-  panicBestMove = null; // Clear old move
+  panicBestMove = null;
 
-  // Set watchdog timer to handle timeout
   if (panicWatchdogTimer) {
     clearTimeout(panicWatchdogTimer);
   }
   panicWatchdogTimer = setTimeout(handlePanicTimeout, PANIC_TIMEOUT_MS);
 
   try {
-    panicEngine.postMessage("stop"); // Stop any ongoing calculation
+    panicEngine.postMessage("stop");
     panicEngine.postMessage("position fen " + fen);
     panicEngine.postMessage("go depth 1");
-    console.log(`[⚡ PANIC] 🔍 Calculating: ${fen.split(' ')[0].substring(0, 20)}...`);
+    console.log(`[⚡ PANIC SF8] 🔍 Calculating: ${fen.split(' ')[0].substring(0, 20)}...`);
   } catch (e) {
-    console.error('[⚡ PANIC] ❌ Engine error:', e);
+    console.error('[⚡ PANIC SF8] ❌ Engine error:', e);
     panicEngineCalculating = false;
     if (panicWatchdogTimer) {
       clearTimeout(panicWatchdogTimer);
       panicWatchdogTimer = null;
     }
-    // Try to reinitialize
     reinitializePanicEngine();
   }
+}
+
+// --- JS-CHESS-ENGINE FUNCTIONS ---
+function completeFen(partialFen) {
+  const parts = partialFen.split(" ");
+  if (parts.length === 2) {
+    return `${parts[0]} ${parts[1]} KQkq - 0 1`;
+  }
+  return partialFen;
+}
+
+function convertMoveToLichess(move) {
+  const from = Object.keys(move)[0].toLowerCase();
+  const to = Object.values(move)[0].toLowerCase();
+  return from + to;
+}
+
+function trySendJsChessMove() {
+  if (!jsChessPendingMove) {
+    console.log(`[JS-Chess] ❌ No pending move to send`);
+    return false;
+  }
+
+  if (gameEnded) {
+    console.log(`[JS-Chess] ❌ Game ended, clearing pending move`);
+    jsChessPendingMove = null;
+    jsChessPendingFen = null;
+    jsChessRetryCount = 0;
+    jsChessWaitingForReconnect = false;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  if (pendingMoveUci) {
+    console.log(`[JS-Chess] ❌ Move already pending: ${pendingMoveUci}`);
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  if (!webSocketWrapper || webSocketWrapper.readyState !== 1) {
+    jsChessRetryCount++;
+    console.log(`[JS-Chess] ⏳ WebSocket not ready (attempt ${jsChessRetryCount}/${JS_CHESS_MAX_RETRIES}), cached: ${jsChessPendingMove}`);
+
+    if (jsChessRetryCount >= JS_CHESS_MAX_RETRIES) {
+      console.log(`[JS-Chess] 📡 Max retries reached, waiting for reconnect...`);
+      jsChessWaitingForReconnect = true;
+      isProcessing = false;
+      pendingMove = false;
+      scheduleReconnectRetry();
+      return false;
+    }
+
+    // Schedule retry
+    setTimeout(() => {
+      if (jsChessPendingMove && !jsChessWaitingForReconnect) {
+        trySendJsChessMove();
+      }
+    }, JS_CHESS_RETRY_INTERVAL);
+
+    return false;
+  }
+
+  // Verify it's still our turn and position matches
+  const cgWrap = $('.cg-wrap')[0];
+  if (!cgWrap) {
+    console.log(`[JS-Chess] ❌ No board found`);
+    jsChessPendingMove = null;
+    jsChessPendingFen = null;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+  if (game.turn() !== myCol) {
+    console.log(`[JS-Chess] ❌ Not our turn anymore`);
+    jsChessPendingMove = null;
+    jsChessPendingFen = null;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  // Verify position (compare piece positions only)
+  const currentFenPieces = game.fen().split(' ')[0];
+  const cachedFenPieces = jsChessPendingFen ? jsChessPendingFen.split(' ')[0] : null;
+
+  if (cachedFenPieces && currentFenPieces !== cachedFenPieces) {
+    console.log(`[JS-Chess] ❌ Position changed, need recalculation`);
+    jsChessPendingMove = null;
+    jsChessPendingFen = null;
+    jsChessRetryCount = 0;
+    isProcessing = false;
+    pendingMove = false;
+    // Trigger recalculation
+    setTimeout(processTurn, 50);
+    return false;
+  }
+
+  // All checks passed - send the move!
+  const lagClaim = panicModeEnabled ? getPanicLagCompensation() : getLagCompensation();
+  const clockSecs = getClockSeconds();
+  const levelToUse = panicModeEnabled ? PANIC_LEVEL : JS_CHESS_AI_LEVEL;
+
+  console.log(`[JS-Chess] ✅ Sending: ${jsChessPendingMove} | Level: ${levelToUse} | Clock: ${clockSecs.toFixed(1)}s | Lag: ${lagClaim}ms${panicModeEnabled ? ' [PANIC]' : ''}`);
+
+  webSocketWrapper.send(JSON.stringify({
+    t: "move",
+    d: { u: jsChessPendingMove, a: currentAck, b: panicModeEnabled ? 1 : 0, l: lagClaim }
+  }));
+
+  jsChessPendingMove = null;
+  jsChessPendingFen = null;
+  jsChessRetryCount = 0;
+  jsChessWaitingForReconnect = false;
+  pendingMove = false;
+  isProcessing = false;
+  return true;
+}
+
+function jsChessCalculateMove(fen) {
+  try {
+    // If already waiting for reconnect with a valid move, don't recalculate
+    if (jsChessWaitingForReconnect && jsChessPendingMove) {
+      const currentFenPieces = fen.split(' ')[0];
+      const cachedFenPieces = jsChessPendingFen ? jsChessPendingFen.split(' ')[0] : null;
+
+      if (cachedFenPieces === currentFenPieces) {
+        console.log(`[JS-Chess] ⏳ Already waiting for reconnect with move: ${jsChessPendingMove}`);
+        return;
+      }
+    }
+
+    // If we have a cached move for this exact position, try to send it
+    if (jsChessPendingMove && jsChessPendingFen) {
+      const currentFenPieces = fen.split(' ')[0];
+      const cachedFenPieces = jsChessPendingFen.split(' ')[0];
+
+      if (cachedFenPieces === currentFenPieces) {
+        console.log(`[JS-Chess] ♻️ Using cached move: ${jsChessPendingMove}`);
+        trySendJsChessMove();
+        return;
+      }
+    }
+
+    // Calculate new move
+    const fullFen = completeFen(fen);
+    const jsChessEngine = window["js-chess-engine"];
+
+    if (!jsChessEngine) {
+      console.error('[JS-Chess] ❌ Engine not loaded!');
+      isProcessing = false;
+      pendingMove = false;
+      return;
+    }
+
+    const levelToUse = panicModeEnabled ? PANIC_LEVEL : JS_CHESS_AI_LEVEL;
+
+    console.log(`[JS-Chess] 🔍 Calculating (Level ${levelToUse}): ${fen.split(' ')[0].substring(0, 20)}...`);
+
+    const move = jsChessEngine.aiMove(fullFen, levelToUse);
+    const bestMove = convertMoveToLichess(move);
+
+    console.log(`[JS-Chess] ✅ Calculated: ${bestMove}`);
+
+    // Cache the move
+    jsChessPendingMove = bestMove;
+    jsChessPendingFen = fen;
+    jsChessRetryCount = 0;
+    jsChessWaitingForReconnect = false;
+
+    // Try to send immediately
+    trySendJsChessMove();
+
+  } catch (error) {
+    console.error("[JS-Chess] ❌ Error:", error);
+    jsChessPendingMove = null;
+    jsChessPendingFen = null;
+    jsChessRetryCount = 0;
+    jsChessWaitingForReconnect = false;
+    isProcessing = false;
+    pendingMove = false;
+  }
+}
+
+// --- TOMITANK 1.5 ENGINE FUNCTIONS ---
+function tomitank15CalculateMove(fen) {
+  if (tomitank15Calculating) {
+    console.log('[Tomitank 1.5] ⏳ Engine busy, waiting...');
+    return;
+  }
+
+  if (tomitank15PendingMove && tomitank15PendingFen) {
+    const currentFenPieces = fen.split(' ')[0];
+    const cachedFenPieces = tomitank15PendingFen.split(' ')[0];
+    if (cachedFenPieces === currentFenPieces) {
+      console.log(`[Tomitank 1.5] ♻️ Using cached move: ${tomitank15PendingMove}`);
+      trySendTomitank15Move();
+      return;
+    }
+  }
+
+  tomitank15Calculating = true;
+  tomitank15PendingFen = fen;
+  tomitank15PendingMove = null;
+  panicLastRequestTime = Date.now();
+
+  const depthToUse = panicModeEnabled ? 1 : TOMITANK15_DEPTH;
+  const searchTime = panicModeEnabled ? 50 : 500;
+  const timeoutMs = panicModeEnabled ? 500 : TOMITANK15_TIMEOUT_MS;
+
+  try {
+    const timeoutId = setTimeout(() => {
+      if (tomitank15Calculating) {
+        console.log('[Tomitank 1.5] ⚠️ Timeout, resetting');
+        tomitank15Calculating = false;
+        isProcessing = false;
+        pendingMove = false;
+
+        // Fallback: try js-chess-engine if tomitank fails
+        // FIXED: Removed space in !gameEnded
+        if (panicModeEnabled && !gameEnded) {
+          console.log('[Tomitank 1.5] 🔄 Falling back to js-chess-engine');
+          jsChessCalculateMove(fen);
+        }
+      }
+    }, timeoutMs);
+
+    // FIXED: Removed spaces in fen.split and .substring
+    console.log(`[Tomitank 1.5] 🔍 Calculating: ${fen.split(' ')[0].substring(0, 20)}...`);
+
+    let move = null;
+
+    // METHOD 1: Try Tomitank's typical API
+    if (typeof window.initBoard === 'function' && typeof window.search === 'function') {
+      window.initBoard(fen);
+      move = window.search(depthToUse, searchTime);
+    }
+    // METHOD 2: Try alternative API
+    // FIXED: Removed space in window.SetFEN
+    else if (typeof window.SetFEN === 'function' && typeof window.Search === 'function') {
+      window.SetFEN(fen);
+      move = window.Search(depthToUse);
+    }
+    // METHOD 3: Try the original expected API
+    else if (typeof window.FENToBoard === 'function' && typeof window.SearchPosition === 'function') {
+      window.START_FEN = fen;
+      window.FENToBoard();
+      if (typeof window.maxSearchTime !== 'undefined') {
+        window.maxSearchTime = searchTime;
+      }
+      window.SearchPosition(depthToUse);
+      if (window.bestMove) {
+        move = typeof window.FormatMove === 'function'
+          ? window.FormatMove(window.bestMove)
+          : window.bestMove;
+      }
+    }
+    // METHOD 4: Check if it's a class-based engine
+    else if (typeof window.TomitankChess !== 'undefined') {
+      const engine = new window.TomitankChess();
+      engine.setFEN(fen);
+      move = engine.search(depthToUse);
+    }
+    // METHOD 5: Check if engine is already instantiated
+    // FIXED: Removed spaces in window.engine
+    else if (typeof window.engine !== 'undefined' && typeof window.engine.search === 'function') {
+      window.engine.setFEN ? window.engine.setFEN(fen) : null;
+      move = window.engine.search(depthToUse);
+    }
+
+    if (move) {
+      // Normalize move format to UCI (e.g., "e2e4")
+      if (typeof move === 'object') {
+        move = move.from + move.to + (move.promotion || '');
+      }
+      move = String(move).toLowerCase().replace(/[^a-h1-8qrbn]/g, '');
+
+      if (move.length >= 4) {
+        tomitank15PendingMove = move;
+        // FIXED: Removed space in [PANIC] string check
+        console.log(`[Tomitank 1.5] ✅ Calculated: ${move}${panicModeEnabled ? ' [PANIC]' : ''}`);
+        clearTimeout(timeoutId);
+        tomitank15Calculating = false;
+        trySendTomitank15Move();
+        return;
+      }
+    }
+
+    // If we get here, no move was found
+    console.log('[Tomitank 1.5] ✗ No move found, engine may not be loaded correctly');
+    clearTimeout(timeoutId);
+    tomitank15Calculating = false;
+    isProcessing = false;
+    pendingMove = false;
+
+  } catch (e) {
+    console.error('[Tomitank 1.5] ❌ Error:', e);
+    tomitank15Calculating = false;
+    isProcessing = false;
+    pendingMove = false;
+  }
+}
+
+function trySendTomitank15Move() {
+  if (!tomitank15PendingMove) {
+    console.log('[Tomitank 1.5] ❌ No pending move');
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  if (gameEnded) {
+    console.log('[Tomitank 1.5] ❌ Game ended');
+    tomitank15PendingMove = null;
+    tomitank15PendingFen = null;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  if (pendingMoveUci) {
+    console.log(`[Tomitank 1.5] ❌ Move already pending: ${pendingMoveUci}`);
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  if (!webSocketWrapper || webSocketWrapper.readyState !== 1) {
+    console.log('[Tomitank 1.5] ⏳ WebSocket not ready');
+    scheduleReconnectRetry();
+    return false;
+  }
+
+  const cgWrap = $('.cg-wrap')[0];
+  if (!cgWrap) {
+    tomitank15PendingMove = null;
+    tomitank15PendingFen = null;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+  if (game.turn() !== myCol) {
+    console.log('[Tomitank 1.5] ❌ Not our turn');
+    tomitank15PendingMove = null;
+    tomitank15PendingFen = null;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  const lagClaim = panicModeEnabled ? getPanicLagCompensation() : getLagCompensation();
+  const clockSecs = getClockSeconds();
+
+  console.log(`[Tomitank 1.5] ✅ Sending:  ${tomitank15PendingMove} | Clock: ${clockSecs.toFixed(1)}s | Lag: ${lagClaim}ms${panicModeEnabled ? ' [PANIC]' : ''}`);
+
+  webSocketWrapper.send(JSON.stringify({
+    t: "move",
+    d: { u: tomitank15PendingMove, a: currentAck, b: panicModeEnabled ? 1 : 0, l: lagClaim }
+  }));
+
+  tomitank15PendingMove = null;
+  tomitank15PendingFen = null;
+  isProcessing = false;
+  pendingMove = false;
+  return true;
+}
+
+// --- TOMITANK 5.1 ENGINE FUNCTIONS ---
+function tomitank51CalculateMove(fen) {
+  if (tomitank51Calculating) {
+    console.log('[Tomitank 5.1] ⏳ Engine busy, waiting...');
+    return;
+  }
+
+  if (tomitank51PendingMove && tomitank51PendingFen) {
+    const currentFenPieces = fen.split(' ')[0];
+    const cachedFenPieces = tomitank51PendingFen.split(' ')[0];
+    if (cachedFenPieces === currentFenPieces) {
+      console.log(`[Tomitank 5.1] ♻️ Using cached move: ${tomitank51PendingMove}`);
+      trySendTomitank51Move();
+      return;
+    }
+  }
+
+  tomitank51Calculating = true;
+  tomitank51PendingFen = fen;
+  tomitank51PendingMove = null;
+  panicLastRequestTime = Date.now();  // ADDED: Track timing for watchdog
+
+  // ADDED: Panic-aware parameters
+  const depthToUse = panicModeEnabled ? TOMITANK51_PANIC_DEPTH : TOMITANK51_DEPTH;
+  const searchTime = panicModeEnabled ? TOMITANK51_PANIC_SEARCH_TIME : 800;
+  const timeoutMs = panicModeEnabled ? 300 : TOMITANK51_TIMEOUT_MS;
+
+  try {
+    const timeoutId = setTimeout(() => {
+      if (tomitank51Calculating) {
+        console.log('[Tomitank 5.1] ⚠️ Timeout, resetting');
+        tomitank51Calculating = false;
+        isProcessing = false;
+        pendingMove = false;
+      }
+    }, timeoutMs);
+
+    console.log(`[Tomitank 5.1] 🔍 Calculating (depth ${depthToUse}, time ${searchTime}ms): ${fen.split(' ')[0].substring(0, 20)}...`);
+
+    // FIXED: Removed space in window.START_FEN
+    if (typeof window.START_FEN !== 'undefined') {
+      window.START_FEN = fen;
+    }
+    if (typeof window.FENToBoard === 'function') {
+      window.FENToBoard();
+    }
+    if (typeof window.maxSearchTime !== 'undefined') {
+      window.maxSearchTime = searchTime; // FIXED: Now panic-aware
+    }
+
+    // FIXED: Removed space in window.SearchPosition
+    if (typeof window.SearchPosition === 'function') {
+      window.SearchPosition(depthToUse); // FIXED: Now panic-aware
+
+      if (typeof window.bestMove !== 'undefined' && window.bestMove) {
+        // FIXED: Removed spaces in window.bestMove and formatting
+        const move = typeof window.FormatMove === 'function'
+          ? window.FormatMove(window.bestMove.move || window.bestMove)
+          : String(window.bestMove);
+
+        tomitank51PendingMove = move;
+        // FIXED: Removed space in console.log
+        console.log(`[Tomitank 5.1] ✅ Calculated: ${move}${panicModeEnabled ? ' [PANIC]' : ''}`);
+        clearTimeout(timeoutId);
+        tomitank51Calculating = false;
+        trySendTomitank51Move();
+      } else {
+        clearTimeout(timeoutId);
+        tomitank51Calculating = false;
+        isProcessing = false;
+        pendingMove = false;
+      }
+    }
+  } catch (e) {
+    // FIXED: Removed space in console.error
+    console.error('[Tomitank 5.1] ❌ Error:', e);
+    tomitank51Calculating = false;
+    isProcessing = false;
+    pendingMove = false;
+  }
+}
+
+function trySendTomitank51Move() {
+  if (!tomitank51PendingMove) {
+    console.log('[Tomitank 5.1] ❌ No pending move');
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  if (gameEnded) {
+    console.log('[Tomitank 5.1] ❌ Game ended');
+    tomitank51PendingMove = null;
+    tomitank51PendingFen = null;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  if (pendingMoveUci) {
+    console.log(`[Tomitank 5.1] ❌ Move already pending:  ${pendingMoveUci}`);
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  if (!webSocketWrapper || webSocketWrapper.readyState !== 1) {
+    console.log('[Tomitank 5.1] ⏳ WebSocket not ready');
+    scheduleReconnectRetry();
+    return false;
+  }
+
+  const cgWrap = $('.cg-wrap')[0];
+  if (!cgWrap) {
+    tomitank51PendingMove = null;
+    tomitank51PendingFen = null;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+  if (game.turn() !== myCol) {
+    console.log('[Tomitank 5.1] ❌ Not our turn');
+    tomitank51PendingMove = null;
+    tomitank51PendingFen = null;
+    isProcessing = false;
+    pendingMove = false;
+    return false;
+  }
+
+  const lagClaim = panicModeEnabled ? getPanicLagCompensation() : getLagCompensation();
+  const clockSecs = getClockSeconds();
+
+  console.log(`[Tomitank 5.1] ✅ Sending:  ${tomitank51PendingMove} | Clock: ${clockSecs.toFixed(1)}s | Lag: ${lagClaim}ms${panicModeEnabled ? ' [PANIC]' : ''}`);
+
+  webSocketWrapper.send(JSON.stringify({
+    t: "move",
+    d: { u: tomitank51PendingMove, a: currentAck, b: panicModeEnabled ? 1 : 0, l: lagClaim }
+  }));
+
+  tomitank51PendingMove = null;
+  tomitank51PendingFen = null;
+  isProcessing = false;
+  pendingMove = false;
+  return true;
 }
 
 // --- socket wrapper ---
@@ -309,23 +908,19 @@ const webSocketProxy = new Proxy(window.WebSocket, {
     let ws = new target(...args);
     webSocketWrapper = ws;
 
-    // Wrap send to prevent duplicate moves
     const originalSend = ws.send.bind(ws);
     ws.send = function(data) {
       try {
         const msg = JSON.parse(data);
         if (msg.t === 'move' && msg.d && msg.d.u) {
-          // Block if game ended
           if (gameEnded) {
             console.log(`[Send] ❌ Blocked (game ended): ${msg.d.u}`);
             return;
           }
-          // Block duplicate of pending move
           if (pendingMoveUci === msg.d.u && !lastMoveAcked) {
             console.log(`[Send] ❌ Blocked (duplicate pending): ${msg.d.u}`);
             return;
           }
-          // Track this move
           pendingMoveUci = msg.d.u;
           lastMoveAcked = false;
           console.log(`[Send] ✅ ${msg.d.u} | a: ${msg.d.a} | l: ${msg.d.l}ms`);
@@ -334,104 +929,179 @@ const webSocketProxy = new Proxy(window.WebSocket, {
       return originalSend(data);
     };
 
-    // NEW: Track WebSocket state changes for reconnection handling
     ws.addEventListener("open", function() {
       console.log('[WebSocket] ✅ Connected');
+      const wasDisconnected = lastWebSocketState === 3 || lastWebSocketState === null;
       lastWebSocketState = 1;
 
-      // Reset panic state on reconnect
-      if (panicModeEnabled) {
-        panicEngineCalculating = false;
-        pendingMoveUci = null;
-        isProcessing = false;
-        pendingMove = false;
-        console.log('[⚡ PANIC] 🔄 State reset after reconnect');
+      // Reset state for ALL engines on reconnect
+      panicEngineCalculating = false;
+      pendingMoveUci = null;
+      isProcessing = false;
+      pendingMove = false;
+
+      console.log(`[Reconnect] 🔄 State reset (engine: ${selectedEngine}, wasDisconnected: ${wasDisconnected})`);
+
+      // Handle js-chess pending move on reconnect
+      if (selectedEngine === 'jschess' && jsChessPendingMove && !gameEnded) {
+        jsChessWaitingForReconnect = false;
+
+        const cgWrap = $('.cg-wrap')[0];
+        if (cgWrap) {
+          const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+
+          if (game.turn() === myCol) {
+            const currentFenPieces = game.fen().split(' ')[0];
+            const cachedFenPieces = jsChessPendingFen ? jsChessPendingFen.split(' ')[0] : null;
+
+            if (cachedFenPieces === currentFenPieces) {
+              console.log(`[JS-Chess] 🔄 WebSocket open: Sending cached move: ${jsChessPendingMove}`);
+
+              // Small delay to ensure connection is stable
+              setTimeout(() => {
+                if (webSocketWrapper && webSocketWrapper.readyState === 1 && jsChessPendingMove) {
+                  trySendJsChessMove();
+                }
+              }, 50);
+              return;
+            } else {
+              console.log(`[JS-Chess] 🔄 WebSocket open: Position changed, will recalculate`);
+              jsChessPendingMove = null;
+              jsChessPendingFen = null;
+              jsChessRetryCount = 0;
+            }
+          }
+        }
+      }
+
+      // Auto-resume if it's our turn
+      if (!gameEnded && autoHint) {
+        const cgWrap = $('.cg-wrap')[0];
+        if (cgWrap) {
+          const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+          if (game.turn() === myCol) {
+            setTimeout(processTurn, 100);
+          }
+        }
       }
     });
 
     ws.addEventListener("close", function() {
       console.log('[WebSocket] ❌ Disconnected');
       lastWebSocketState = 3;
+
+      // Mark js-chess as waiting for reconnect if it has a pending move
+      if (selectedEngine === 'jschess' && jsChessPendingMove) {
+        jsChessWaitingForReconnect = true;
+        console.log(`[JS-Chess] 📡 WebSocket closed, will retry move on reconnect: ${jsChessPendingMove}`);
+      }
     });
 
     ws.addEventListener("error", function() {
       console.log('[WebSocket] ⚠️ Error');
-      // Reset panic engine state on error
       panicEngineCalculating = false;
+
+      if (selectedEngine === 'jschess' && jsChessPendingMove) {
+        jsChessWaitingForReconnect = true;
+      }
     });
 
     ws.addEventListener("message", function(event) {
       try {
         let msg = JSON.parse(event.data);
 
-        // Track ACK - move was accepted
         if (msg.t === 'ack') {
           lastMoveAcked = true;
           console.log(`[ACK] Move accepted: ${pendingMoveUci}`);
-          // Clear pending state
           pendingMoveUci = null;
+
+          // Clear js-chess pending on successful ack
+          if (selectedEngine === 'jschess') {
+            jsChessPendingMove = null;
+            jsChessPendingFen = null;
+            jsChessRetryCount = 0;
+            jsChessWaitingForReconnect = false;
+          }
         }
 
-        // Track game end
         if (msg.t === 'endData' || (msg.d && msg.d.status && msg.d.winner)) {
           gameEnded = true;
           isProcessing = false;
           pendingMove = false;
-          panicEngineCalculating = false; // Stop panic engine
+          panicEngineCalculating = false;
+          jsChessPendingMove = null;
+          jsChessPendingFen = null;
+          jsChessWaitingForReconnect = false;
+          tomitank15PendingMove = null;
+          tomitank15PendingFen = null;
+          tomitank15Calculating = false;
+          tomitank51PendingMove = null;
+          tomitank51PendingFen = null;
+          tomitank51Calculating = false;
           console.log(`[Game] Ended - blocking further moves`);
         }
 
-        // Track move confirmations
         if (msg.t === 'move' && msg.d) {
           if (typeof msg.d.ply !== 'undefined') {
             currentAck = msg.d.ply;
           }
 
-          // Update lag tracking from server response
           if (msg.d.clock) {
             updateServerLag(msg.d.clock);
           }
 
-          // Check for game end in move response
           if (msg.d.status || msg.d.winner) {
             gameEnded = true;
             isProcessing = false;
             pendingMove = false;
             panicEngineCalculating = false;
+            jsChessPendingMove = null;
+            jsChessPendingFen = null;
+            jsChessWaitingForReconnect = false;
           }
 
-          // Clear pending after our move is confirmed
           if (msg.d.uci === pendingMoveUci) {
             pendingMoveUci = null;
           }
         }
 
-        // Intercept FEN for panic engine - only if panic mode is enabled via UI AND game not ended
+        // Intercept FEN for panic mode engines
         if (!gameEnded && panicModeEnabled && msg.d && typeof msg.d.fen === "string" && typeof msg.v === "number") {
           if (autoHint && !pendingMoveUci) {
             let interceptedFen = msg.d.fen;
             let isWhitesTurn = msg.v % 2 == 0;
             interceptedFen += isWhitesTurn ? " w" : " b";
-            // Check if it's our turn before calculating
+
             const cgWrap = $('.cg-wrap')[0];
             if (cgWrap) {
               const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
               const turnChar = isWhitesTurn ? 'w' : 'b';
               if (myCol === turnChar) {
-                console.log(`[⚡ PANIC INTERCEPT] FEN detected, using panic engine`);
-                panicCalculateMove(interceptedFen);
+                console.log(`[⚡ PANIC INTERCEPT] FEN detected, using ${selectedEngine} engine`);
+                if (selectedEngine === 'jschess') {
+                  jsChessCalculateMove(interceptedFen);
+                } else if (selectedEngine === 'tomitank15') {
+                  tomitank15CalculateMove(interceptedFen);
+                } else if (selectedEngine === 'tomitank51') {
+                  tomitank51CalculateMove(interceptedFen);
+                } else {
+                  panicCalculateMoveSF8(interceptedFen);
+                }
               }
             }
           }
         }
 
-        // NEW: Handle reload/reconnect messages
         if (msg.t === 'reload' || msg.t === 'resync') {
-          console.log(`[WebSocket] 🔄 ${msg.t} received, resetting panic state`);
+          console.log(`[WebSocket] 🔄 ${msg.t} received, resetting state`);
           panicEngineCalculating = false;
           pendingMoveUci = null;
           isProcessing = false;
           pendingMove = false;
+          jsChessPendingMove = null;
+          jsChessPendingFen = null;
+          jsChessRetryCount = 0;
+          jsChessWaitingForReconnect = false;
         }
       } catch (e) {}
     });
@@ -457,11 +1127,11 @@ const PRESETS = {
   '7.5s': {
     engineMs: 12,
     varied: {
-      maxCpLoss: 900,          // MODIFIED: Allows huge blunders (hanging queen/mate)
+      maxCpLoss: 900,
       weights: [8, 40, 28, 24],
-      maxBlundersPerGame: 50,   // MODIFIED: High limit
+      maxBlundersPerGame: 50,
       blunderThreshold: 100,
-      blunderChance: 0.45,      // MODIFIED: 45% chance to play the bad move
+      blunderChance: 0.45,
     },
     human: {
       baseDelayMs: 180,
@@ -483,7 +1153,7 @@ const PRESETS = {
   '15s': {
     engineMs: 20,
     varied: {
-      maxCpLoss: 300,            // Normal safety
+      maxCpLoss: 300,
       weights: [10, 45, 23, 22],
       maxBlundersPerGame: 10,
       blunderThreshold: 100,
@@ -509,7 +1179,7 @@ const PRESETS = {
   '30s': {
     engineMs: 60,
     varied: {
-      maxCpLoss: 200,            // Strict safety
+      maxCpLoss: 200,
       weights: [30, 55, 10, 5],
       maxBlundersPerGame: 5,
       blunderThreshold: 100,
@@ -637,105 +1307,47 @@ function countPieces() {
   return cachedPieceCount;
 }
 
-// Checks if a move leads to a draw or 3-fold repetition
-function checkDrawishMoves(pvs) {
-  const validMoves = [];
-  const drawishMoves = [];
-
-  try {
-    const tempGame = new Chess();
-    // 1. Load history once
-    tempGame.load_pgn(game.pgn());
-
-    for (let i = 0; i < pvs.length && i < 4; i++) {
-      if (!pvs[i]?.firstMove) continue;
-
-      const uci = pvs[i].firstMove;
-
-      // 2. Simplified Config: Always request Queen promotion.
-      // chess.js will only use this if the move actually allows promotion.
-      const moveConfig = {
-        from: uci.substring(0, 2),
-        to: uci.substring(2, 4),
-        promotion: 'q'
-      };
-
-      const moveResult = tempGame.move(moveConfig);
-
-      if (!moveResult) continue;
-
-      // 3. Check status
-      const isDrawish = tempGame.in_threefold_repetition() || tempGame.in_draw();
-
-      if (isDrawish) {
-        console.log(`[Anti-Draw] 🚫 ${uci} leads to draw`);
-        drawishMoves.push({ ...pvs[i], idx: i });
-      } else {
-        validMoves.push({ ...pvs[i], idx: i });
-      }
-
-      // 4. Undo
-      tempGame.undo();
-    }
-  } catch (e) {
-    console.error("[Anti-Draw] Error:", e);
-  }
-
-  return { validMoves, drawishMoves };
-}
-
 // Optimized Anti-Draw & Selection
 function selectVariedMove(pvs) {
   if (!pvs || pvs.length === 0) return null;
 
   const valid = [];
-  const pgn = game.pgn(); // Fetch PGN once
+  const pgn = game.pgn();
 
-  // --- OPTIMIZED DRAW CHECK ---
   try {
     const tempGame = new Chess();
-    tempGame.load_pgn(pgn); // 1. Restore full history for 3-fold detection
+    tempGame.load_pgn(pgn);
 
     for (let i = 0; i < pvs.length && i < 4; i++) {
       if (!pvs[i]?.firstMove) continue;
 
       const uci = pvs[i].firstMove;
 
-      // 2. Try move with "Always Queen" promotion
       const moveResult = tempGame.move({
         from: uci.substring(0, 2),
         to: uci.substring(2, 4),
-        promotion: 'q' // STRICTLY ENFORCE QUEEN
+        promotion: 'q'
       });
 
-      // If move is valid (legal), check for draw
       if (moveResult) {
         const isDraw = tempGame.in_threefold_repetition() || tempGame.in_draw();
-
-        // 3. Undo immediately to reset for next loop iteration
         tempGame.undo();
 
         if (isDraw) {
           console.log(`[Anti-Draw] 🚫 Skipping ${uci} (leads to draw/repetition)`);
-          continue; // Skip this move, do not add to valid
+          continue;
         }
 
-        // If we get here, it's valid and not a draw
         valid.push({ ...pvs[i], idx: i });
       }
     }
   } catch (e) {
     console.error("[Anti-Draw] Safety fallback triggered:", e);
-    // If checking fails, allow all moves to prevent freeze
     for (let i = 0; i < pvs.length && i < 4; i++) {
-       if (pvs[i]) valid.push({ ...pvs[i], idx: i });
+      if (pvs[i]) valid.push({ ...pvs[i], idx: i });
     }
   }
 
-  // --- FALLBACKS & SELECTION ---
-
-  // If ALL moves were draws (forced draw), we must play one.
-  // Reload valid array with everything.
   if (valid.length === 0) {
     console.log('[Anti-Draw] ⚠️ Forced draw detected. Playing best available.');
     for (let i = 0; i < pvs.length && i < 4; i++) {
@@ -748,7 +1360,6 @@ function selectVariedMove(pvs) {
   const cfg = activeVaried;
   const topEval = valid[0].evalCp || 0;
 
-  // Blunder Logic
   let allowBlunder = false;
   if (gameBlunderCount < cfg.maxBlundersPerGame && topEval > -100 && Math.random() < cfg.blunderChance) {
     allowBlunder = true;
@@ -761,7 +1372,6 @@ function selectVariedMove(pvs) {
     const cpLoss = topEval - (pv.evalCp || 0);
     const isBlunder = cpLoss >= cfg.blunderThreshold;
 
-    // Safety: Don't blunder into immediate mate (Mate in 1, 2, or 3)
     if (pv.evalType === 'mate' && pv.mateVal !== null && pv.mateVal < 0 && pv.mateVal >= -3) continue;
 
     if (cpLoss > cfg.maxCpLoss) {
@@ -775,7 +1385,6 @@ function selectVariedMove(pvs) {
     candidates.push({ ...pv, weight, cpLoss, isBlunder });
   }
 
-  // Final Selection
   if (candidates.length === 0) {
     varietyStats.pv1++;
     return { ...valid[0], move: valid[0].firstMove };
@@ -790,7 +1399,6 @@ function selectVariedMove(pvs) {
     if (rand <= 0) { selected = c; break; }
   }
 
-  // Stats
   if (selected.idx === 0) varietyStats.pv1++;
   else if (selected.idx === 1) varietyStats.pv2++;
   else if (selected.idx === 2) varietyStats.pv3++;
@@ -810,12 +1418,10 @@ function calculateHumanDelay(uci) {
   const cfg = activeHuman;
   const clockSecs = getClockSeconds();
 
-  // PANIC MODE via UI button - instant moves
   if (panicModeEnabled) {
     return 0;
   }
 
-  // CAPTURES - always instant
   if (uci && uci.length >= 4) {
     const targetSquare = uci.substring(2, 4);
     const targetPiece = game.get(targetSquare);
@@ -826,19 +1432,16 @@ function calculateHumanDelay(uci) {
 
   const pc = countPieces();
 
-  // Premove mode
   if (pc <= cfg.premovePieceThreshold) {
     const delay = cfg.premoveDelayMs + Math.random() * (cfg.premoveMaxMs - cfg.premoveDelayMs);
     return Math.max(0, Math.round(delay));
   }
 
-  // Low piece mode
   if (pc <= cfg.lowPieceThreshold) {
     const delay = cfg.lowPieceDelayMs + Math.random() * (cfg.lowPieceMaxMs - cfg.lowPieceDelayMs);
     return Math.max(0, Math.round(delay));
   }
 
-  // Normal mode
   let delay = cfg.baseDelayMs;
   delay *= (1 + (Math.random() * 2 - 1) * cfg.randomVariance);
 
@@ -879,7 +1482,7 @@ function resetStats() {
   console.log('[Stats] Reset');
 }
 
-// --- Stockfish ---
+// --- Main Stockfish (stockfish.js) ---
 const SF_THREADS = 4;
 const sfListeners = new Set();
 
@@ -887,7 +1490,7 @@ stockfish.onmessage = (e) => {
   const data = String(e.data || '');
   if (data === 'readyok') {
     engineReady = true;
-    console.log('[Engine] ✅ Ready! ');
+    console.log('[Engine SF] ✅ Ready! ');
   }
   for (const fn of sfListeners) {
     try { fn(e); } catch(x) {}
@@ -896,7 +1499,7 @@ stockfish.onmessage = (e) => {
 
 function configureEngine() {
   return new Promise((resolve) => {
-    console.log('[Engine] Configuring...');
+    console.log('[Engine SF] Configuring...');
     stockfish.postMessage('uci');
     stockfish.postMessage('setoption name Threads value 1');
     stockfish.postMessage('setoption name Contempt value 20');
@@ -947,10 +1550,17 @@ function parseInfoLine(text) {
 
 function getMultiPV(fen, retryCount = 0) {
   return new Promise((resolve) => {
-    // CHECK FOR PANIC MODE via UI button - bypass to faster engine
     if (panicModeEnabled) {
-      console.log(`[⚡ PANIC BYPASS] Panic mode enabled via UI - Using panic engine`);
-      panicCalculateMove(fen);
+      console.log(`[⚡ PANIC BYPASS] Using ${selectedEngine} engine`);
+      if (selectedEngine === 'jschess') {
+        jsChessCalculateMove(fen);
+      } else if (selectedEngine === 'tomitank15') {
+        tomitank15CalculateMove(fen);
+      } else if (selectedEngine === 'tomitank51') {
+        tomitank51CalculateMove(fen);
+      } else {
+        panicCalculateMoveSF8(fen);
+      }
       resolve([]);
       return;
     }
@@ -1064,7 +1674,6 @@ function drawArrows(pvs) {
 
 // --- Execute Move ---
 function executeMove(uci) {
-  // Guards
   if (!uci) return false;
   if (gameEnded) {
     console.log(`[Exec] ❌ Game ended`);
@@ -1088,7 +1697,6 @@ function executeMove(uci) {
 
   const now = Date.now();
 
-  // Duplicate check
   if (uci === lastMoveSent && (now - lastMoveSentTime) < 500) {
     console.log(`[Exec] ❌ Duplicate blocked: ${uci}`);
     return false;
@@ -1097,10 +1705,9 @@ function executeMove(uci) {
   lastMoveSent = uci;
   lastMoveSentTime = now;
 
-  // Smart lag compensation - use panic compensation when panic mode enabled
   const lagClaim = panicModeEnabled ? getPanicLagCompensation() : getLagCompensation();
 
-  console.log(`[Exec] ✅ Sending: ${uci} | Lag: ${lagClaim}ms (server avg: ${getAverageServerLag()}ms)${panicModeEnabled ? ' [PANIC]' : ''}`);
+  console.log(`[Exec] ✅ Sending: ${uci} | Lag: ${lagClaim}ms (server avg: ${getAverageServerLag()}ms)${panicModeEnabled ? ' [PANIC]' : ''} | Engine: ${selectedEngine}`);
   webSocketWrapper.send(JSON.stringify({ t: "move", d: { u: uci, a: currentAck, b: panicModeEnabled ? 1 : 0, l: lagClaim } }));
   pendingMove = false;
   isProcessing = false;
@@ -1110,14 +1717,12 @@ function executeMove(uci) {
 function executeMoveHumanized(uci, engineMs = 0) {
   if (!uci) { isProcessing = false; return; }
 
-  // PANIC MODE via UI button - direct execute
   if (panicModeEnabled) {
     console.log(`[⚡ PANIC MODE] ${uci} - using direct execute`);
     executeMove(uci);
     return;
   }
 
-  // Instant capture
   if (uci.length >= 4) {
     const targetSquare = uci.substring(2, 4);
     const targetPiece = game.get(targetSquare);
@@ -1180,7 +1785,6 @@ function actOnHint(data, engineMs = 0) {
 
 // --- Process Turn ---
 async function processTurn() {
-  // Guards
   if (gameEnded) return;
   if (isProcessing) return;
   if (pendingMoveUci) return;
@@ -1200,11 +1804,18 @@ async function processTurn() {
   const currentFen = game.fen();
   const t0 = performance.now();
 
-  // PANIC MODE CHECK via UI button - bypass all logic, use panic engine
+  // PANIC MODE CHECK
   if (panicModeEnabled) {
-    console.log(`[⚡ PANIC MODE] Clock: ${clockSecs.toFixed(1)}s - Using panic engine (UI enabled)`);
-    panicCalculateMove(currentFen);
-    // Don't wait - panic engine will handle move execution
+    console.log(`[⚡ PANIC MODE] Clock: ${clockSecs.toFixed(1)}s - Using ${selectedEngine} engine`);
+    if (selectedEngine === 'jschess') {
+      jsChessCalculateMove(currentFen);
+    } else if (selectedEngine === 'tomitank15') {
+      tomitank15CalculateMove(currentFen);
+    } else if (selectedEngine === 'tomitank51') {
+      tomitank51CalculateMove(currentFen);
+    } else {
+      panicCalculateMoveSF8(currentFen);
+    }
     return;
   }
 
@@ -1212,10 +1823,10 @@ async function processTurn() {
     let pvs;
     let engineTime;
 
-    // Normal mode - use full engine
+    // Normal mode - use main stockfish.js
     pvs = await getMultiPV(currentFen);
     engineTime = Math.round(performance.now() - t0);
-    console.log(`[Engine] Clock: ${clockSecs.toFixed(1)}s | Took: ${engineTime}ms`);
+    console.log(`[Engine SF] Clock: ${clockSecs.toFixed(1)}s | Took: ${engineTime}ms`);
 
     if (!pvs || pvs.length === 0) {
       isProcessing = false;
@@ -1313,7 +1924,7 @@ function createBottomDock() {
 
   const content = document.createElement('div');
   content.id = 'lf-bottom-dock-content';
-  content.style.cssText = 'display: flex;align-items:center;gap: 6px;';
+  content.style.cssText = 'display: flex;align-items: center;gap: 6px;';
 
   bar.appendChild(toggle);
   bar.appendChild(content);
@@ -1333,27 +1944,37 @@ function createBottomDock() {
   return content;
 }
 
-// NEW: Global panic mode watchdog - runs every 1 second to detect frozen state
+// Panic watchdog
 function startPanicWatchdog() {
   setInterval(() => {
     if (!panicModeEnabled || gameEnded) return;
 
-    // Check if panic engine is stuck
-    if (panicEngineCalculating) {
+    // FIXED: Check ALL engine calculating states
+    const anyEngineCalculating = panicEngineCalculating ||
+                                 tomitank15Calculating ||
+                                 tomitank51Calculating;
+
+    if (anyEngineCalculating) {
       const elapsed = Date.now() - panicLastRequestTime;
       if (elapsed > PANIC_TIMEOUT_MS * 2) {
         console.log(`[⚡ PANIC WATCHDOG] Engine stuck for ${elapsed}ms, forcing recovery`);
+
+        // FIXED: Reset ALL engine states
         panicEngineCalculating = false;
+        tomitank15Calculating = false;
+        tomitank51Calculating = false;
         panicEngineRetryCount++;
 
         if (panicEngineRetryCount >= PANIC_MAX_RETRIES) {
           reinitializePanicEngine();
         }
 
-        // Retry if it's our turn
+        // FIXED: Removed space in selector $('.cg-wrap')
         const cgWrap = $('.cg-wrap')[0];
         if (cgWrap && !pendingMoveUci) {
+          // FIXED: Removed space in .classList
           const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+          // FIXED: Removed space in game.turn()
           if (game.turn() === myCol) {
             isProcessing = false;
             pendingMove = false;
@@ -1363,12 +1984,13 @@ function startPanicWatchdog() {
       }
     }
 
-    // Check for stuck processing state
-    if (isProcessing && !panicEngineCalculating && !pendingMoveUci) {
+    // FIXED: Check for stuck processing with any engine
+    if (isProcessing && !anyEngineCalculating && !pendingMoveUci) {
       console.log(`[⚡ PANIC WATCHDOG] Processing stuck, resetting`);
       isProcessing = false;
       pendingMove = false;
 
+      // FIXED: Removed space in selector $('.cg-wrap')
       const cgWrap = $('.cg-wrap')[0];
       if (cgWrap) {
         const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
@@ -1383,18 +2005,17 @@ function startPanicWatchdog() {
 // --- Main ---
 async function run() {
   console.log('[Init] Starting...');
+  console.log(`[Init] Selected Engine: ${selectedEngine}`);
 
-  // Initialize panic engine early
+  // Initialize panic engine (stockfish8)
   initializePanicEngine();
 
-  // NEW: Start panic watchdog
   startPanicWatchdog();
 
   await configureEngine();
   setupPieceSelectMode();
   syncGameState();
 
-  // Initial Turn Check
   const cgWrap = $('.cg-wrap')[0];
   if (cgWrap) {
     const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
@@ -1412,7 +2033,6 @@ async function run() {
 
       try { game.move(lastEl.textContent); } catch (e) {}
 
-      // CLEAR ALL CACHES - position changed
       cachedPVs = null;
       cachedPVsFen = null;
       cachedPieceCount = null;
@@ -1420,16 +2040,34 @@ async function run() {
       isProcessing = false;
       pendingMove = false;
 
-      // Reset duplicate move tracking on position change
       lastMoveSent = null;
       lastMoveSentTime = 0;
       pendingMoveUci = null;
       lastMoveAcked = false;
 
-      // Reset panic engine state on new position
       panicEngineCalculating = false;
       panicLastFenRequested = null;
       panicBestMove = null;
+
+      // Reset JS Chess state on new move
+      if (selectedEngine === 'jschess') {
+        jsChessPendingMove = null;
+        jsChessPendingFen = null;
+        jsChessRetryCount = 0;
+        jsChessWaitingForReconnect = false;
+      }
+
+      // Reset Tomitank state on new move
+      if (selectedEngine === 'tomitank15') {
+        tomitank15PendingMove = null;
+        tomitank15PendingFen = null;
+        tomitank15Calculating = false;
+      }
+      if (selectedEngine === 'tomitank51') {
+        tomitank51PendingMove = null;
+        tomitank51PendingFen = null;
+        tomitank51Calculating = false;
+      }
 
       setTimeout(processTurn, 100);
     }
@@ -1480,176 +2118,142 @@ async function run() {
   autoBtn.style.backgroundColor = autoHint ? "green" : "";
   autoBtn.onclick = () => {
     autoHint = !autoHint;
-    localStorage.setItem('autorun', autoHint ? "1" : "0");
+    autoRun = autoHint ? "1" : "0";
+    localStorage.setItem('autorun', autoRun);
     autoBtn.innerText = autoHint ? 'Auto-ON' : 'Auto-OFF';
     autoBtn.style.backgroundColor = autoHint ? "green" : "";
-    if (autoHint) { isProcessing = false; processTurn(); }
+    if (autoHint) processTurn();
   };
   if (btnCont) btnCont.appendChild(autoBtn);
 
-  // 3. Config Toggle
-  const CFG_ORDER = ['7.5s', '15s', '30s'];
-  const CFG_COLORS = { '7.5s': "#8E44AD", '15s': "#A93226", '30s': "#229954" };
-
-  const configBtn = document.createElement('button');
-  configBtn.innerText = `Cfg: ${configMode}`;
-  configBtn.classList.add('fbt');
-  configBtn.style.backgroundColor = CFG_COLORS[configMode] || "#229954";
-  configBtn.style.fontSize = "10px";
-  configBtn.onclick = () => {
-    const idx = Math.max(0, CFG_ORDER.indexOf(configMode));
-    const newMode = CFG_ORDER[(idx + 1) % CFG_ORDER.length];
-    applyConfig(newMode);
-    configBtn.innerText = `Cfg: ${newMode}`;
-    configBtn.style.backgroundColor = CFG_COLORS[newMode] || "#229954";
-  };
-  if (btnCont) btnCont.appendChild(configBtn);
-
-  // 4. Arrow Toggle
-  const arrowBtn = document.createElement('button');
-  arrowBtn.innerText = showArrows ? 'Arr-ON' : 'Arr-OFF';
-  arrowBtn.classList.add('fbt');
-  arrowBtn.style.fontSize = "10px";
-  arrowBtn.style.opacity = showArrows ? "1" : "0.5";
-  arrowBtn.onclick = () => {
-    showArrows = !showArrows;
-    localStorage.setItem('showArrows', showArrows ? "1" : "0");
-    arrowBtn.innerText = showArrows ? 'Arr-ON' : 'Arr-OFF';
-    arrowBtn.style.opacity = showArrows ? "1" : "0.5";
-    if (!showArrows) { const l = $('svg.cg-shapes g')[0]; if (l) l.innerHTML = ''; }
-  };
-  if (btnCont) btnCont.appendChild(arrowBtn);
-
-  // 5. Piece Mode
-  const pieceBtn = document.createElement('button');
-  pieceBtn.innerText = pieceSelectMode ? 'Piece-ON' : 'Piece-OFF';
-  pieceBtn.classList.add('fbt');
-  pieceBtn.style.fontSize = "9px";
-  pieceBtn.style.backgroundColor = pieceSelectMode ? "#2980B9" : "";
-  pieceBtn.onclick = () => {
-    pieceSelectMode = !pieceSelectMode;
-    localStorage.setItem('pieceSelectMode', pieceSelectMode ? "1" : "0");
-    pieceBtn.innerText = pieceSelectMode ? 'Piece-ON' : 'Piece-OFF';
-    pieceBtn.style.backgroundColor = pieceSelectMode ? "#2980B9" : "";
-  };
-  if (btnCont) btnCont.appendChild(pieceBtn);
-
-  // 6. Human Mode
-  const humanBtn = document.createElement('button');
-  humanBtn.innerText = humanMode ? 'Human-ON' : 'Human-OFF';
-  humanBtn.classList.add('fbt');
-  humanBtn.style.fontSize = "9px";
-  humanBtn.style.backgroundColor = humanMode ? "#E74C3C" : "";
-  humanBtn.onclick = () => {
-    humanMode = !humanMode;
-    localStorage.setItem('humanMode', humanMode ? "1" : "0");
-    humanBtn.innerText = humanMode ? 'Human-ON' : 'Human-OFF';
-    humanBtn.style.backgroundColor = humanMode ? "#E74C3C" : "";
-    if (humanMode) resetStats();
-  };
-  if (btnCont) btnCont.appendChild(humanBtn);
-
-  // 7. Vary Mode
-  const varyBtn = document.createElement('button');
-  varyBtn.innerText = variedMode ? 'Vary-ON' : 'Vary-OFF';
-  varyBtn.classList.add('fbt');
-  varyBtn.style.fontSize = "9px";
-  varyBtn.style.backgroundColor = variedMode ? "#9B59B6" : "";
-  varyBtn.onclick = () => {
-    variedMode = !variedMode;
-    localStorage.setItem('variedMode', variedMode ? "1" : "0");
-    varyBtn.innerText = variedMode ? 'Vary-ON' : 'Vary-OFF';
-    varyBtn.style.backgroundColor = variedMode ? "#9B59B6" : "";
-  };
-  if (btnCont) btnCont.appendChild(varyBtn);
-
-  // 8. PANIC MODE BUTTON (NEW - replaces threshold-based activation)
+  // 3. Panic Button
   const panicBtn = document.createElement('button');
-  panicBtn.innerText = panicModeEnabled ? '⚡PANIC-ON' : '⚡PANIC';
+  panicBtn.innerText = panicModeEnabled ? 'PANIC: ON' : 'Panic: Off';
   panicBtn.classList.add('fbt');
-  panicBtn.style.fontSize = "9px";
-  panicBtn.style.backgroundColor = panicModeEnabled ? "#E74C3C" : "";
-  panicBtn.style.fontWeight = "bold";
-  panicBtn.title = "Enable instant moves using fast panic engine (depth 2)";
+  panicBtn.style.backgroundColor = panicModeEnabled ? "red" : "";
+  panicBtn.style.color = panicModeEnabled ? "white" : "";
   panicBtn.onclick = () => {
     panicModeEnabled = !panicModeEnabled;
-    panicBtn.innerText = panicModeEnabled ? '⚡PANIC-ON' : '⚡PANIC';
-    panicBtn.style.backgroundColor = panicModeEnabled ? "#E74C3C" : "";
-    console.log(`[⚡ PANIC] ${panicModeEnabled ? 'ENABLED' : 'DISABLED'} via UI button`);
+    panicBtn.innerText = panicModeEnabled ? 'PANIC: ON' : 'Panic: Off';
+    panicBtn.style.backgroundColor = panicModeEnabled ? "red" : "";
+    panicBtn.style.color = panicModeEnabled ? "white" : "";
 
-    // If enabling panic mode and it's our turn, immediately trigger
-    if (panicModeEnabled && autoHint) {
-      isProcessing = false;
-      pendingMove = false;
-      processTurn();
+    if (panicModeEnabled) {
+      console.log('[UI] 🚨 PANIC MODE ACTIVATED');
+      const cg = document.querySelector('.cg-wrap');
+      if (cg) {
+        const myCol = cg.classList.contains('orientation-white') ? 'w' : 'b';
+        if (game.turn() === myCol) {
+          isProcessing = false;
+          pendingMove = false;
+          processTurn();
+        }
+      }
+    } else {
+      console.log('[UI] 😌 Panic mode deactivated');
     }
   };
   if (btnCont) btnCont.appendChild(panicBtn);
 
-  // 9. VPN Lag Offset Button
-  const lagBtn = document.createElement('button');
-  const updateLagBtnText = () => {
-    const avgLag = getAverageServerLag();
-    const normalClaim = getLagCompensation();
-    const panicClaim = getPanicLagCompensation();
-    lagBtn.innerText = `+${vpnPingOffset}`;
-    lagBtn.style.backgroundColor = vpnPingOffset > 0 ? "#1ABC9C" : "";
-    lagBtn.title = [
-      `Server avg: ${avgLag}ms`,
-      `VPN offset: +${vpnPingOffset}ms`,
-      `Normal claim: ${normalClaim}ms`,
-      `Panic claim: ${panicClaim}ms`
-    ].join('\n');
+  // 4. Engine Selector
+  const engBtn = document.createElement('button');
+  engBtn.innerText = `Eng: ${selectedEngine}`;
+  engBtn.classList.add('fbt');
+  engBtn.onclick = () => {
+    if (selectedEngine === 'stockfish') selectedEngine = 'stockfish8';
+    else if (selectedEngine === 'stockfish8') selectedEngine = 'jschess';
+    else if (selectedEngine === 'jschess') selectedEngine = 'tomitank15';
+    else if (selectedEngine === 'tomitank15') selectedEngine = 'tomitank51';
+    else selectedEngine = 'stockfish';
+
+    localStorage.setItem('selectedEngine', selectedEngine);
+    engBtn.innerText = `Eng: ${selectedEngine}`;
+    console.log(`[UI] Engine switched to: ${selectedEngine}`);
   };
+  if (btnCont) btnCont.appendChild(engBtn);
+
+  // 5. Config Selector
+  const cfgBtn = document.createElement('button');
+  cfgBtn.innerText = `Cfg: ${configMode}`;
+  cfgBtn.classList.add('fbt');
+  cfgBtn.onclick = () => {
+    const modes = Object.keys(PRESETS);
+    let idx = modes.indexOf(configMode);
+    idx = (idx + 1) % modes.length;
+    applyConfig(modes[idx]);
+    cfgBtn.innerText = `Cfg: ${configMode}`;
+  };
+  if (btnCont) btnCont.appendChild(cfgBtn);
+
+  // 6. Visuals (Arrow) Toggle
+  const visBtn = document.createElement('button');
+  visBtn.innerText = showArrows ? 'Arrow: ON' : 'Arrow: OFF';
+  visBtn.classList.add('fbt');
+  visBtn.onclick = () => {
+    showArrows = !showArrows;
+    localStorage.setItem('showArrows', showArrows ? "1" : "0");
+    visBtn.innerText = showArrows ? 'Arrow: ON' : 'Arrow: OFF';
+    if (!showArrows) {
+       const layer = document.querySelector('svg.cg-shapes g');
+       if (layer) layer.innerHTML = '';
+    }
+  };
+  if (btnCont) btnCont.appendChild(visBtn);
+
+  // 7. Piece Select Button
+  const pieceBtn = document.createElement('button');
+  pieceBtn.innerText = pieceSelectMode ? 'Piece: ON' : 'Piece: OFF';
+  pieceBtn.classList.add('fbt');
+  pieceBtn.onclick = () => {
+    pieceSelectMode = !pieceSelectMode;
+    localStorage.setItem('pieceSelectMode', pieceSelectMode ? "1" : "0");
+    pieceBtn.innerText = pieceSelectMode ? 'Piece: ON' : 'Piece: OFF';
+  };
+  if (btnCont) btnCont.appendChild(pieceBtn);
+
+  // 8. Human Mode Button
+  const humanBtn = document.createElement('button');
+  humanBtn.innerText = humanMode ? 'Human: ON' : 'Human: OFF';
+  humanBtn.classList.add('fbt');
+  humanBtn.onclick = () => {
+    humanMode = !humanMode;
+    localStorage.setItem('humanMode', humanMode ? "1" : "0");
+    humanBtn.innerText = humanMode ? 'Human: ON' : 'Human: OFF';
+  };
+  if (btnCont) btnCont.appendChild(humanBtn);
+
+  // 9. Variance Button
+  const varBtn = document.createElement('button');
+  varBtn.innerText = variedMode ? 'Var: ON' : 'Var: OFF';
+  varBtn.classList.add('fbt');
+  varBtn.onclick = () => {
+    variedMode = !variedMode;
+    localStorage.setItem('variedMode', variedMode ? "1" : "0");
+    varBtn.innerText = variedMode ? 'Var: ON' : 'Var: OFF';
+  };
+  if (btnCont) btnCont.appendChild(varBtn);
+
+  // 10. Lag Button
+  const lagBtn = document.createElement('button');
+  lagBtn.innerText = `Lag: ${vpnPingOffset}ms`;
   lagBtn.classList.add('fbt');
-  lagBtn.style.fontSize = "9px";
-  updateLagBtnText();
   lagBtn.onclick = () => {
-    const offsets = [0, 30, 50, 80, 100, 150];
-    const idx = offsets.indexOf(vpnPingOffset);
-    vpnPingOffset = offsets[(idx + 1) % offsets.length];
+    if (vpnPingOffset === 0) vpnPingOffset = 50;
+    else if (vpnPingOffset === 50) vpnPingOffset = 100;
+    else if (vpnPingOffset === 100) vpnPingOffset = 200;
+    else vpnPingOffset = 0;
     localStorage.setItem('vpnPingOffset', vpnPingOffset);
-    updateLagBtnText();
-    console.log(`[Lag] VPN: +${vpnPingOffset}ms | Server: ${getAverageServerLag()}ms | Claim: ${getLagCompensation()}ms`);
+    lagBtn.innerText = `Lag: ${vpnPingOffset}ms`;
   };
   if (btnCont) btnCont.appendChild(lagBtn);
 
-  // Stats Display
-  const stats = document.createElement('span');
-  stats.id = 'human-stats';
-  stats.style.cssText = 'font-size: 9px;color:#888;margin-left:5px;display:none;';
-  if (btnCont) btnCont.appendChild(stats);
-
-  setInterval(() => {
-    const el = document.getElementById('human-stats');
-    if (!el) return;
-    updateLagBtnText(); // Update lag button too
-    if (humanMode && humanTimingStats.totalMoves > 0) {
-      const avg = Math.round((humanTimingStats.totalTimeMs + humanTimingStats.engineTimeMs) / humanTimingStats.totalMoves);
-      const proj = Math.round(30000 / avg);
-      const tot = varietyStats.pv1 + varietyStats.pv2 + varietyStats.pv3 + varietyStats.pv4;
-      const pv1p = tot > 0 ? Math.round(varietyStats.pv1 / tot * 100) : 0;
-      el.textContent = variedMode
-        ? `${avg}ms|${configMode}|PV1: ${pv1p}%|⚠️${gameBlunderCount}${panicModeEnabled ? '|⚡' : ''}`
-        : `${avg}ms|${configMode}${panicModeEnabled ? '|⚡' : ''}`;
-      el.style.display = 'inline';
-    } else {
-      el.style.display = 'none';
-    }
-  }, 1000);
-
-  $('.fbt').on('mousedown', function() {
-    this.style.border = '6px solid blue';
-    setTimeout((a) => { a.style.border = ''; }, 500, this);
-  });
-
-  $(document).on("keydown", (e) => {
-    if (e.key === "w") { hintBtn.click(); autoBtn.click(); }
-    if (e.key === "p") pieceBtn.click();
-    if (e.key === "h") humanBtn.click();
-    if (e.key === "v") varyBtn.click();
-    if (e.key === "l") lagBtn.click();
-  });
+  console.log('[Init] UI Setup Complete.');
 }
 
-waitForElement('rm6').then(() => run());
+// --- ENTRY POINT ---
+const startCheck = setInterval(() => {
+    if (document.querySelector('.cg-wrap') || document.querySelector('#main-wrap')) {
+        clearInterval(startCheck);
+        run();
+    }
+}, 200);
